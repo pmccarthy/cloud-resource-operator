@@ -13,4 +13,4 @@ spec:
   # i want a postgres storage of a development-level tier
   tier: development
   # the type i want for a postgres storage
-  type: REPLACE_ME
+  type: managed
