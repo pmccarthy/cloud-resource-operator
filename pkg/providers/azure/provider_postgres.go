@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -39,6 +38,7 @@ const (
 	defaultAzurePostgresSubnet       = "-postgres"
 	defaultAzurePostgresSubnetPrefix = ""
 	defaultAzurePostgresVnetRuleName = "postgres-vnet-rule"
+	azureServiceEndpointSQL          = "Microsoft.Sql"
 )
 
 var _ providers.PostgresProvider = &PostgresProvider{}
@@ -82,6 +82,11 @@ func (p *PostgresProvider) GetReconcileTime(ps *v1alpha1.Postgres) time.Duration
 }
 
 func (p *PostgresProvider) CreatePostgres(ctx context.Context, ps *v1alpha1.Postgres) (*providers.PostgresInstance, croType.StatusMessage, error) {
+	// handle provider-specific finalizer
+	if err := resources.CreateFinalizer(ctx, p.Client, ps, DefaultFinalizer); err != nil {
+		return nil, "failed to set finalizer", err
+	}
+
 	// Retrieve Cluster Configuration ConfigMap
 	clusterConfigMap, err := p.ConfigManager.getClusterConfig(ctx)
 	if err != nil {
@@ -125,23 +130,19 @@ func (p *PostgresProvider) CreatePostgres(ctx context.Context, ps *v1alpha1.Post
 		p.Logger.Errorf("Unable to get postgres client: %v", err)
 	}
 
-	// Declare empty postgres host string variable - gets populated further along
-	var postgresHost string
-
 	// Check if Postgres Instance already exists
 	foundInstances, err := getAzurePostgresInstances(ctx, postgresClient)
-	foundInstance := false
+	var postgresHost string
 	for i := range *foundInstances.Value {
 		if ps.Name == *(*foundInstances.Value)[i].Name {
 			p.Logger.Debugf("Found Azure Postgres Instance: %v. Skipping creation", ps.Name)
-			foundInstance = true
 			// Set Postgres host
 			postgresHost = *(*foundInstances.Value)[i].FullyQualifiedDomainName
 			break
 		}
 	}
 	// Create Postgres instance if it doesn't already exist
-	if foundInstance == false {
+	if postgresHost == "" {
 		p.Logger.Debugf("Creating Azure Postgres Instance: %v", ps.Name)
 		postgresServer, err := createorUpdateAzurePostgres(ctx, postgresClient, clusterConfig.ResourceGroup, ps.Name, clusterConfig.Location, postgresPass)
 		if err != nil {
@@ -162,30 +163,38 @@ func (p *PostgresProvider) CreatePostgres(ctx context.Context, ps *v1alpha1.Post
 		p.Logger.Errorf("Error retrieving worker node subnet configurations %v", err)
 	}
 
-	res2 := &workerNodeSubnetConfig
-	res3, _ := json.Marshal(res2)
-	p.Logger.Debugf("TEST: %v", string(res3))
-
-	// serviceEndpoints := *(*workerNodeSubnetConfig.SubnetPropertiesFormat).ServiceEndpoints
-	// for i := range serviceEndpoints {
-	// 	p.Logger.Debugf("ENDPOINT %v", *serviceEndpoints[i].Service)
-	// }
-
-	workerNodeSubnetAddressPrefix := *(*workerNodeSubnetConfig.SubnetPropertiesFormat).AddressPrefix
-	workerNodeSubnetID := *workerNodeSubnetConfig.ID
-	workerNodeSecurityGroupID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/%s", os.Getenv("AZURE_SUBSCRIPTION_ID"), clusterConfig.ResourceGroup, clusterConfig.SecurityGroupName)
-
-	// Set postgres config variables
-	postgresSubnetName := clusterConfig.SubnetName + defaultAzurePostgresSubnet
-	// Takes worker node subnet CIDR range and increments by a count to generate new Postgres subnet
-	// For example, worker node subnet CIDR range of 10.40.0.212/24 will generate postgres subnet CIDR range of 10.41.0.212/24 when count is set to 1
-	postgresSubnetCidr, err := incrementCidrAddress(workerNodeSubnetAddressPrefix, 3)
-	if err != nil {
-		p.Logger.Errorf("Unable to set postgres CIDR range: %v", err)
+	serviceEndpoints := *(*workerNodeSubnetConfig.SubnetPropertiesFormat).ServiceEndpoints
+	var foundServiceEndpoint bool
+	for i := range serviceEndpoints {
+		// p.Logger.Debugf("ENDPOINT %v", *serviceEndpoints[i].Service)
+		if *serviceEndpoints[i].Service == azureServiceEndpointSQL {
+			foundServiceEndpoint = true
+			break
+		}
 	}
 
+	if !foundServiceEndpoint {
+		serviceEndpoints = append(serviceEndpoints, network.ServiceEndpointPropertiesFormat{
+			Service: to.StringPtr(azureServiceEndpointSQL),
+		})
+		*(*workerNodeSubnetConfig.SubnetPropertiesFormat).ServiceEndpoints = serviceEndpoints
+	}
+
+	workerNodeSubnetName := *workerNodeSubnetConfig.Name
+	workerNodeSubnetID := *workerNodeSubnetConfig.ID
+	// workerNodeSecurityGroupID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/%s", os.Getenv("AZURE_SUBSCRIPTION_ID"), clusterConfig.ResourceGroup, clusterConfig.SecurityGroupName)
+
+	// Set postgres config variables
+	// postgresSubnetName := clusterConfig.SubnetName + defaultAzurePostgresSubnet
+	// Takes worker node subnet CIDR range and increments by a count to generate new Postgres subnet
+	// For example, worker node subnet CIDR range of 10.40.0.212/24 will generate postgres subnet CIDR range of 10.41.0.212/24 when count is set to 1
+	// postgresSubnetCidr, err := incrementCidrAddress(workerNodeSubnetAddressPrefix, 3)
+	// if err != nil {
+	// 	p.Logger.Errorf("Unable to set postgres CIDR range: %v", err)
+	// }
+
 	// Create or update dedicated postgres subnet
-	_, err = createOrUpdateAzureSubnet(ctx, subnetsClient, clusterConfig.VnetResourceGroup, clusterConfig.VnetName, postgresSubnetName, postgresSubnetCidr, clusterConfig.SecurityGroupName, workerNodeSecurityGroupID)
+	_, err = createOrUpdateAzureSubnet(ctx, subnetsClient, clusterConfig.VnetResourceGroup, clusterConfig.VnetName, workerNodeSubnetName, workerNodeSubnetConfig)
 	if err != nil {
 		p.Logger.Errorf("Error creating or updating postgres subnet configuration: %v", err)
 	}
@@ -272,29 +281,25 @@ func createorUpdateAzurePostgres(ctx context.Context, client postgresql.ServersC
 	return future.Result(client)
 }
 
-func createOrUpdateAzureSubnet(ctx context.Context, client network.SubnetsClient, resourceGroupName string, vnetName string, subnetName string, addressPrefix string, securityGroup string, securityGroupID string) (subnet network.Subnet, err error) {
-	future, err := client.CreateOrUpdate(
-		ctx,
-		resourceGroupName,
-		vnetName,
-		subnetName,
-		network.Subnet{
-			SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
-				AddressPrefix: to.StringPtr(addressPrefix),
-				NetworkSecurityGroup: &network.SecurityGroup{
-					Name: to.StringPtr(securityGroup),
-					ID:   to.StringPtr(securityGroupID),
-				},
-				ServiceEndpoints: &[]network.ServiceEndpointPropertiesFormat{
-					{
-						Service: to.StringPtr("Microsoft.ContainerRegistry"),
-					},
-					{
-						Service: to.StringPtr("Microsoft.Sql"),
-					},
-				},
-			},
-		})
+func createOrUpdateAzureSubnet(ctx context.Context, client network.SubnetsClient, resourceGroupName string, vnetName string, subnetName string, subnetConfig network.Subnet) (subnet network.Subnet, err error) {
+	future, err := client.CreateOrUpdate(ctx, resourceGroupName, vnetName, subnetName, subnetConfig)
+	// network.Subnet{
+	// 	SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
+	// 		AddressPrefix: to.StringPtr(addressPrefix),
+	// 		NetworkSecurityGroup: &network.SecurityGroup{
+	// 			Name: to.StringPtr(securityGroup),
+	// 			ID:   to.StringPtr(securityGroupID),
+	// 		},
+	// 		ServiceEndpoints: &[]network.ServiceEndpointPropertiesFormat{
+	// 			{
+	// 				Service: to.StringPtr("Microsoft.ContainerRegistry"),
+	// 			},
+	// 			{
+	// 				Service: to.StringPtr("Microsoft.Sql"),
+	// 			},
+	// 		},
+	// 	},
+	// })
 	if err != nil {
 		return subnet, fmt.Errorf("cannot create or update subnet: %v", err)
 	}

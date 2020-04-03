@@ -13,6 +13,7 @@ import (
 const (
 	DefaultConfigMapName      = "cloud-provider-config"
 	DefaultConfigMapNamespace = "openshift-config"
+	DefaultFinalizer          = "finalizers.cloud-resources-operator.integreatly.org"
 )
 
 //go:generate moq -out config_moq.go . ConfigManager
