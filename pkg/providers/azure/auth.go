@@ -3,18 +3,17 @@ package azure
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 
-	"github.com/Azure/azure-sdk-for-go/profiles/latest/network/mgmt/network"
-	"github.com/Azure/azure-sdk-for-go/profiles/latest/postgresql/mgmt/postgresql"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 )
 
-// Interface for Azure authentication
+var _ AuthManager = &AuthCredentials{}
+
 type AuthManager interface {
-	authEnvVars(ctx context.Context, config *v1.ConfigMap) error
+	AuthEnvVars(ctx context.Context, config *v1.ConfigMap) []error
 }
 
 type AuthCredentials struct {
@@ -23,68 +22,30 @@ type AuthCredentials struct {
 	AadClientSecret string
 	SubscriptionID  string
 	Logger          *logrus.Entry
+	Errors          []error
 }
 
-var _ AuthManager = (*AuthCredentials)(nil)
-
-func NewAuthManager() *AuthCredentials {
+func NewDefaultAuthManager() *AuthCredentials{
 	return &AuthCredentials{}
 }
 
-func (a *AuthCredentials) authEnvVars(ctx context.Context, config *v1.ConfigMap) error {
+func (a *AuthCredentials) AuthEnvVars(ctx context.Context, config *v1.ConfigMap) []error {
 	// Parse configmap
-	var authCredentials AuthCredentials
-	json.Unmarshal([]byte(config.Data["config"]), &authCredentials)
+	json.Unmarshal([]byte(config.Data["config"]), &a)
 	// Array of required environment variables for auth
 	envVars := [...]string{"AZURE_SUBSCRIPTION_ID", "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"}
 	// Map environment variable names to parsed config data
 	m := make(map[string]string)
-	m["AZURE_SUBSCRIPTION_ID"] = authCredentials.SubscriptionID
-	m["AZURE_TENANT_ID"] = authCredentials.TenantID
-	m["AZURE_CLIENT_ID"] = authCredentials.AadClientID
-	m["AZURE_CLIENT_SECRET"] = authCredentials.AadClientSecret
+	m["AZURE_SUBSCRIPTION_ID"] = a.SubscriptionID
+	m["AZURE_TENANT_ID"] = a.TenantID
+	m["AZURE_CLIENT_ID"] = a.AadClientID
+	m["AZURE_CLIENT_SECRET"] = a.AadClientSecret
 	// Set environment variables
 	for _, s := range envVars {
 		err := os.Setenv(s, m[s])
 		if err != nil {
-			a.Logger.Errorf("error setting environment variable for authentication %v: %v", s, err)
+			a.Errors = append(a.Errors, errors.New(s))
 		}
 	}
-	return nil
+	return a.Errors
 }
-
-func getPostgresClient(ctx context.Context) (client postgresql.ServersClient, err error) {
-	postgresClient := postgresql.NewServersClient(os.Getenv("AZURE_SUBSCRIPTION_ID"))
-	authorizer, err := auth.NewAuthorizerFromEnvironment()
-	if err == nil {
-		postgresClient.Authorizer = authorizer
-	}
-	return postgresClient, err
-}
-
-func getSubnetsClient(ctx context.Context) (client network.SubnetsClient, err error) {
-	subnetsClient := network.NewSubnetsClient(os.Getenv("AZURE_SUBSCRIPTION_ID"))
-	authorizer, err := auth.NewAuthorizerFromEnvironment()
-	if err == nil {
-		subnetsClient.Authorizer = authorizer
-	}
-	return subnetsClient, err
-}
-
-func getVnetRulesClient(ctx context.Context) (client postgresql.VirtualNetworkRulesClient, err error) {
-	vnetRulesClient := postgresql.NewVirtualNetworkRulesClient(os.Getenv("AZURE_SUBSCRIPTION_ID"))
-	authorizer, err := auth.NewAuthorizerFromEnvironment()
-	if err == nil {
-		vnetRulesClient.Authorizer = authorizer
-	}
-	return vnetRulesClient, err
-}
-
-// func getNsgClient(ctx context.Context) (client network.SecurityGroupsClient, err error) {
-// 	nsgClient := network.NewSecurityGroupsClient(os.Getenv("AZURE_SUBSCRIPTION_ID"))
-// 	authorizer, err := auth.NewAuthorizerFromEnvironment()
-// 	if err == nil {
-// 		nsgClient.Authorizer = authorizer
-// 	}
-// 	return nsgClient, err
-// }

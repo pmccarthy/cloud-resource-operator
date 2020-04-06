@@ -16,17 +16,20 @@ const (
 	DefaultFinalizer          = "finalizers.cloud-resources-operator.integreatly.org"
 )
 
-//go:generate moq -out config_moq.go . ConfigManager
-type ConfigManager interface {
-	getClusterConfig(ctx context.Context) (*v1.ConfigMap, error)
-}
+var _ ConfigManager = &ConfigMapConfigManager{}
 
-var _ ConfigManager = (*ConfigMapConfigManager)(nil)
+type ConfigManager interface {
+	GetClusterConfig(ctx context.Context) (*v1.ConfigMap, error)
+}
 
 type ConfigMapConfigManager struct {
 	configMapName      string
 	configMapNamespace string
 	client             client.Client
+}
+
+func NewDefaultConfigMapConfigManager(client client.Client) *ConfigMapConfigManager {
+	return NewConfigMapConfigManager(DefaultConfigMapName, DefaultConfigMapNamespace, client)
 }
 
 func NewConfigMapConfigManager(cm string, namespace string, client client.Client) *ConfigMapConfigManager {
@@ -43,15 +46,6 @@ func NewConfigMapConfigManager(cm string, namespace string, client client.Client
 	}
 }
 
-func NewDefaultConfigMapConfigManager(client client.Client) *ConfigMapConfigManager {
-	return NewConfigMapConfigManager(DefaultConfigMapName, DefaultConfigMapNamespace, client)
-}
-
-func (m *ConfigMapConfigManager) getClusterConfig(ctx context.Context) (*v1.ConfigMap, error) {
-	cm, err := resources.GetConfigMapOrDefault(ctx, m.client, types.NamespacedName{Name: m.configMapName, Namespace: m.configMapNamespace}, m.buildDefaultConfigMap())
-	return cm, err
-}
-
 func (m *ConfigMapConfigManager) buildDefaultConfigMap() *v1.ConfigMap {
 	return &v1.ConfigMap{
 		ObjectMeta: controllerruntime.ObjectMeta{
@@ -59,4 +53,9 @@ func (m *ConfigMapConfigManager) buildDefaultConfigMap() *v1.ConfigMap {
 			Namespace: m.configMapNamespace,
 		},
 	}
+}
+
+func (m *ConfigMapConfigManager) GetClusterConfig(ctx context.Context) (*v1.ConfigMap, error) {
+	cm, err := resources.GetConfigMapOrDefault(ctx, m.client, types.NamespacedName{Name: m.configMapName, Namespace: m.configMapNamespace}, m.buildDefaultConfigMap())
+	return cm, err
 }
